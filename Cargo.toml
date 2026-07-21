@@ -1,0 +1,20 @@
+[package]
+name = "rgain"
+version = "0.1.0"
+authors = ["LJason <ljason@ljason77.com>"]
+edition = "2024"
+license-file = "LICENSE"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
