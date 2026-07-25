@@ -2,10 +2,9 @@
  * Copyright (c) 2026, LJason. All Rights Reserved.
  */
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+mod error;
+mod file_ops;
+mod pipeline;
+
+pub use error::{AppError, AppResult};
+pub use pipeline::{run_pipeline, TrackResult};
