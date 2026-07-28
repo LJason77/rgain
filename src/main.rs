@@ -3,22 +3,25 @@
  */
 
 use std::{
+    collections::HashMap,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufReader, BufWriter, Write},
     path::PathBuf,
     process::ExitCode,
     thread::available_parallelism,
 };
 
 use clap::Parser;
+use hex::FromHex;
 use lofty::{
     config::WriteOptions,
     file::TaggedFileExt,
-    probe::Probe,
+    probe::Probe as LoftyProbe,
     tag::{ItemKey, ItemValue, Tag, TagExt, TagItem},
 };
-use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
-use rgain::{AppError, AppResult, TrackResult, run_pipeline};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rgain::{AppError, AppResult, CacheEntry, GlobalCache, PipelineConfig, Signature, TrackResult, run_pipeline};
+use serde::{Serializer, ser::SerializeMap};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
@@ -70,6 +73,59 @@ fn main() -> ExitCode {
     }
 }
 
+/// 原子化加载缓存：发生任何错误均视为冷启动（返回空表）
+fn load_cache() -> GlobalCache {
+    let Ok(file) = File::open(".rgain_cache.json") else { return HashMap::new() };
+
+    let reader = BufReader::new(file);
+    // 先将 JSON 解析为带 String Key 的临时字典
+    let string_map: HashMap<String, CacheEntry> = serde_json::from_reader(reader).unwrap_or_default();
+
+    // 将其无缝映射为高性能的内部类型
+    string_map
+        .into_par_iter()
+        .filter_map(|(k, v)| {
+            // 直接由 hex 库在内部解析并作为一个完整的 [u8; 32] 标量返回。
+            let arr = <[u8; 32]>::from_hex(&k).ok()?;
+            Some((arr, v))
+        })
+        .collect()
+}
+
+/// 为原生内部缓存实现自定义的外观序列化器
+///
+/// 直接将底层的 `[u8; 32]` 字典转换为 JSON 对象，彻底抹杀中间态 `HashMap<String, &CacheEntry>` 的堆分配雪崩。
+struct CacheSerializer<'a>(&'a GlobalCache);
+
+impl serde::Serialize for CacheSerializer<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // 向 Serde 申请创建一个 JSON Map
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            // 在这一步才实时进行 hex 编码并立刻写入流
+            // 产生的短命 String 会在进入下一次循环前被立刻丢弃，L1 Cache 完美复用
+            map.serialize_entry(&hex::encode(k), v)?;
+        }
+        map.end()
+    }
+}
+
+/// 原子化存储缓存：写入临时文件后执行 OS 级重命名替换
+fn save_cache(cache: &GlobalCache) -> AppResult<()> {
+    let tmp_path = ".rgain_cache.json.tmp";
+    let target_path = ".rgain_cache.json";
+
+    let file = File::create(tmp_path)?;
+    // 增加 BufWriter 减少 write 系统调用
+    let writer = BufWriter::with_capacity(64 * 1024, file);
+
+    // 直接将原生 cache 包装后扔给 serde
+    serde_json::to_writer(writer, &CacheSerializer(cache)).map_err(|e| AppError::Io(std::io::Error::other(e)))?;
+
+    std::fs::rename(tmp_path, target_path)?;
+    Ok(())
+}
+
 /// 命令行执行的主入口调度器
 ///
 /// 本函数负责串联 DSP 核心流水线、数据后处理（Map-Reduce）与 I/O 落地分发。
@@ -78,12 +134,24 @@ fn main() -> ExitCode {
 /// - 核心流水线处理崩溃时返回 `AppError`
 /// - 标签写入或 JSON 报告导出产生 I/O 错误时返回 `AppError`
 fn execute_cli(cli: Cli, threads: usize) -> AppResult<()> {
+    // 静态初始化全局只读环境
+    let probe = symphonia::default::get_probe();
+    let codecs = symphonia::default::get_codecs();
+    let mut cache = load_cache();
+
+    let config = PipelineConfig { offset: cli.offset, write_mode: cli.write, probe, codecs, cache: &cache };
+
     // 触发 DSP 核心并发流水线，获取客观真实的物理增益
-    let mut results = run_pipeline(cli.input, threads)?;
+    let mut results = run_pipeline(cli.input, threads, &config)?;
 
     if results.is_empty() {
         tracing::warn!("未找到任何受支持的音频文件。");
         return Ok(());
+    }
+
+    // 将新计算出的生数据（Raw）并入缓存树
+    for track in &results {
+        cache.entry(track.signature).or_insert_with(|| CacheEntry { raw_lufs: track.raw_lufs, peak: track.peak, last_applied_offset: None });
     }
 
     let offset = cli.offset.unwrap_or(0.0_f32);
@@ -111,37 +179,70 @@ fn execute_cli(cli: Cli, threads: usize) -> AppResult<()> {
 
     export_json_report(&results)?;
 
-    // 根据用户参数进入 I/O 分支
+    // 下发写操作：只有 needs_write == true 的任务才会被发送到底层
     if cli.write {
-        write_tags_concurrently(&results);
+        let success_signatures = write_tags_concurrently(&results);
+
+        // 仅为成功写入磁盘的记录更新最后使用过的 offset
+        for sig in success_signatures {
+            if let Some(entry) = cache.get_mut(&sig) {
+                entry.last_applied_offset = cli.offset;
+            }
+        }
     }
+
+    // 缓存脏页刷盘
+    save_cache(&cache)?;
 
     Ok(())
 }
 
 /// 并发写入模式：将算出的增益注入到音频文件的元数据 (ID3v2/Vorbis) 中。
-fn write_tags_concurrently(results: &[TrackResult]) {
+fn write_tags_concurrently(results: &[TrackResult]) -> Vec<Signature> {
     tracing::info!("开始并发写入 {} 个文件的元数据...", results.len());
 
-    let failed_writes: usize = results
+    let (success_signatures, failed_writes): (Vec<Signature>, usize) = results
         .par_iter()
-        .map(|track| {
-            if let Err(e) = write_single_track_metadata(track) {
-                tracing::error!("写入失败 [{}]: {e:?}", track.path.display());
-                // 计入失败总数
-                1_usize
-            } else {
-                // 成功则为 0
-                0_usize
-            }
-        })
-        .sum();
+        .fold(
+            || (Vec::with_capacity(128), 0_usize),
+            |mut acc, track| {
+                // 如果缓存判定该文件无需覆写(偏移量未变)，直接将其视为“写入成功”，透传签名以维持缓存生命周期，并提前结束本帧流水线
+                if !track.needs_write {
+                    acc.0.push(track.signature);
+                    return acc;
+                }
+
+                // 执行真正的物理脏页刷盘
+                match write_single_track_metadata(track) {
+                    Ok(()) => {
+                        acc.0.push(track.signature);
+                    }
+                    Err(e) => {
+                        // 故障物理隔离：单文件由于 权限/只读属性 报错，不波及全局线程池调度
+                        tracing::error!("写入失败 [{}]: {e:?}", track.path.display());
+                        acc.1 += 1;
+                    }
+                }
+
+                acc
+            },
+        )
+        .reduce(
+            || (Vec::new(), 0_usize),
+            |mut a, mut b| {
+                a.0.append(&mut b.0);
+                a.1 += b.1;
+                a
+            },
+        );
 
     if failed_writes > 0 {
         tracing::warn!("完成写入，但有 {failed_writes} 个文件由于权限或格式损坏写入失败。");
     } else {
         tracing::info!("所有文件元数据写入成功！");
     }
+
+    success_signatures
 }
 
 /// 执行单文件的物理元数据写入 (隔离的底层 I/O 操作)
@@ -154,7 +255,7 @@ fn write_tags_concurrently(results: &[TrackResult]) {
 #[inline]
 fn write_single_track_metadata(track: &TrackResult) -> AppResult<()> {
     // 文件嗅探与流加载：从 VFS 获取文件句柄并交由 Lofty 解析
-    let mut tagged_file = Probe::open(&track.path)
+    let mut tagged_file = LoftyProbe::open(&track.path)
         .map_err(|e| AppError::Io(std::io::Error::other(e)))?
         .read()
         .map_err(|e| AppError::Decode(format!("元数据解析失败: {e}")))?;

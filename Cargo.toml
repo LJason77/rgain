@@ -18,9 +18,11 @@ panic = "abort"
 strip = "symbols"
 
 [dependencies]
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 ebur128 = "0.1"
+hex = "0.4"
 lofty = "0.24"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
