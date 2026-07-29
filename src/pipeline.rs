@@ -175,8 +175,7 @@ fn process_audio_file(path: PathBuf, config: &PipelineConfig) -> AppResult<Track
 
     // 缓存命中拦截
     if let Some(cached) = config.cache.get(&signature) {
-        let offset_val = config.offset.unwrap_or(0.0_f32);
-        let track_gain = -18.0 - cached.raw_lufs + offset_val;
+        let track_gain = -18.0 - cached.raw_lufs;
 
         // 开启了写模式，且目标 offset 与上次成功写入的 offset 不同，才需要发起物理写入
         let needs_write = config.write_mode && cached.last_applied_offset != config.offset;
